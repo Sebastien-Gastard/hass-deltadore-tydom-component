@@ -67,6 +67,11 @@ class MessageHandler:
         self.cmd_prefix = cmd_prefix
         self._cdata_replies: list[Reply] = []
         self._end_reply_events: dict[str, asyncio.Event] = {}
+        # Track unknown unique_ids: refetch configs once, then warn once.
+        self._unknown_uids_retried: set[str] = set()
+        self._unknown_uids_warned: set[str] = set()
+        # Track endpoint errors already warned to avoid log spam.
+        self._endpoint_errors_warned: set[tuple[str, str, int]] = set()
 
     def get_reply(self, transaction_id: str) -> Reply | None:
         """
@@ -274,7 +279,12 @@ class MessageHandler:
                     msg_type = self.parse_devices_data
 
         if msg_type is None:
-            LOGGER.warning("Unknown message type received %s: %s", uri_origin, data)
+            if not data:
+                # Empty body: not a real "unknown type", just an empty reply
+                # (e.g. periodic push acknowledgement). Don't warn.
+                LOGGER.debug("Empty message body received from %s", uri_origin)
+            else:
+                LOGGER.warning("Unknown message type received %s: %s", uri_origin, data)
         else:
             LOGGER.debug("Message received from %s", uri_origin)
             try:
@@ -630,26 +640,39 @@ class MessageHandler:
                     name_of_id = self.get_name_from_id(unique_id)
                     type_of_id = self.get_type_from_id(unique_id)
 
-                    # Check if device is registered in configuration
-                    if not name_of_id or name_of_id == "":
-                        LOGGER.warning(
-                            "Endpoint ignoré (appareil non enregistré dans la configuration) : "
-                            "device_id=%s, endpoint_id=%s, unique_id=%s",
-                            device_id,
-                            endpoint_id,
-                            unique_id,
-                        )
-                        continue
-
-                    if not type_of_id or type_of_id == "":
-                        LOGGER.warning(
-                            "Endpoint ignoré (type d'appareil inconnu) : "
-                            "device_id=%s, endpoint_id=%s, unique_id=%s, name=%s",
-                            device_id,
-                            endpoint_id,
-                            unique_id,
-                            name_of_id,
-                        )
+                    # Check if device is registered in configuration.
+                    # The Tydom gateway may expose endpoints in /devices/data
+                    # that are not (yet) listed in /configs/file. Try a
+                    # one-shot refetch of /configs/file before warning.
+                    if not name_of_id or not type_of_id:
+                        if unique_id not in self._unknown_uids_retried:
+                            self._unknown_uids_retried.add(unique_id)
+                            LOGGER.debug(
+                                "Unknown unique_id=%s in devices/data; "
+                                "refetching /configs/file",
+                                unique_id,
+                            )
+                            try:
+                                await self.tydom_client.get_configs_file()
+                            except Exception:
+                                LOGGER.debug(
+                                    "Refetch /configs/file failed for unique_id=%s",
+                                    unique_id,
+                                    exc_info=True,
+                                )
+                        elif unique_id not in self._unknown_uids_warned:
+                            self._unknown_uids_warned.add(unique_id)
+                            LOGGER.warning(
+                                "Endpoint ignoré (appareil non enregistré dans la "
+                                "configuration, même après refetch) : "
+                                "device_id=%s, endpoint_id=%s, unique_id=%s, "
+                                "name=%r, type=%r",
+                                device_id,
+                                endpoint_id,
+                                unique_id,
+                                name_of_id,
+                                type_of_id,
+                            )
                         continue
 
                     # Check for errors or missing data, but still try to create device
@@ -657,13 +680,28 @@ class MessageHandler:
                     has_data = "data" in endpoint and len(endpoint.get("data", [])) > 0
 
                     if has_error:
-                        LOGGER.warning(
-                            "Endpoint avec erreur (création quand même) : "
-                            "device_id=%s, endpoint_id=%s, error=%s",
-                            device_id,
-                            endpoint_id,
-                            endpoint.get("error"),
+                        error_key = (
+                            str(device_id),
+                            str(endpoint_id),
+                            int(endpoint.get("error") or 0),
                         )
+                        if error_key not in self._endpoint_errors_warned:
+                            self._endpoint_errors_warned.add(error_key)
+                            LOGGER.warning(
+                                "Endpoint avec erreur (création quand même) : "
+                                "device_id=%s, endpoint_id=%s, error=%s",
+                                device_id,
+                                endpoint_id,
+                                endpoint.get("error"),
+                            )
+                        else:
+                            LOGGER.debug(
+                                "Endpoint avec erreur (déjà signalé) : "
+                                "device_id=%s, endpoint_id=%s, error=%s",
+                                device_id,
+                                endpoint_id,
+                                endpoint.get("error"),
+                            )
 
                     if not has_data:
                         LOGGER.warning(
@@ -945,24 +983,12 @@ class MessageHandler:
 
     def get_type_from_id(self, id):
         """Get device type from id."""
-        device_type_detected = ""
-        if id in device_type:
-            device_type_detected = device_type[id]
-        else:
-            LOGGER.warning("Unknown device type (%s)", id)
-        return device_type_detected
+        return device_type.get(id, "")
 
     # Get pretty name for a device id
     def get_name_from_id(self, id):
         """Get device name from id."""
-        name = ""
-        if id in device_name:
-            name = device_name[id]
-        else:
-            for deviceid in device_name:
-                LOGGER.error("- device %s -> %s", deviceid, device_name[deviceid])
-            LOGGER.warning("Unknown device name (%s)", id)
-        return name
+        return device_name.get(id, "")
 
 
 class BytesIOSocket:

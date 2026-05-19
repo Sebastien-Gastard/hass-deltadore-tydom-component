@@ -196,6 +196,19 @@ class HAEntity:
                 alt_name = attribute.split("_")[0]
                 if attribute in self.filtered_attrs or alt_name in self.filtered_attrs:
                     continue
+
+                # Complex values (list/dict) cannot fit in a sensor state
+                # (HA truncates state > 255 chars). They are exposed via
+                # extra_state_attributes on the parent entity instead.
+                if isinstance(value, (list, dict)):
+                    self._registered_sensors.append(attribute)
+                    LOGGER.debug(
+                        "Attribut complexe %s.%s exposé en extra_state_attributes",
+                        self._device.device_id,
+                        attribute,
+                    )
+                    continue
+
                 sensor_class = None
                 if attribute in self.sensor_classes:
                     sensor_class = self.sensor_classes[attribute]
@@ -241,6 +254,37 @@ class HAEntity:
                 )
 
         return sensors
+
+    @property
+    def _attr_extra_state_attributes(self) -> dict[str, Any]:
+        """Expose complex (list/dict) device attributes as state attributes.
+
+        Scalar attributes are exposed as their own sensors via get_sensors().
+        List/dict attributes (e.g. Tydom gateway 'protocols') cannot fit in
+        a sensor state (HA truncates state > 255 chars), so we surface them
+        here on the parent entity.
+
+        Implementation note: we define this as a property on _attr_
+        rather than overriding `extra_state_attributes` directly so that
+        the standard HA Entity property (defined in
+        homeassistant.helpers.entity.Entity) picks it up via its
+        `hasattr(self, "_attr_extra_state_attributes")` check, regardless
+        of the MRO position of HAEntity (always to the right of the HA
+        Entity hierarchy in subclasses).
+        """
+        if self._device is None:
+            return {}
+        attrs: dict[str, Any] = {}
+        for attribute, value in self._device.__dict__.items():
+            if attribute[:1] == "_" or value is None:
+                continue
+            if not isinstance(value, (list, dict)):
+                continue
+            alt_name = attribute.split("_")[0]
+            if attribute in self.filtered_attrs or alt_name in self.filtered_attrs:
+                continue
+            attrs[attribute] = value
+        return attrs
 
     def _get_device_info(self) -> dict[str, str]:
         """Get manufacturer and model from device attributes."""
